@@ -9,6 +9,13 @@ import sys
 import pyperclip as pc
 import os.path
 import hashlib #sha256, pdkdf2_hmac.
+import base64
+import os
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 #TODO: High importance - security! some form of encryption and user authentication is necessary.
 #      Otherwise, general use can likely be improved a bit.
@@ -17,15 +24,25 @@ import hashlib #sha256, pdkdf2_hmac.
 #
 # Ensure master password input is at most 16 characters
 
+#Hash master password securely, and use to verify it. Use unhashed master password as key to en/decrypt
+#passwords in database. This is independent of verification so a hacked db achieves nothing but annoyance
+#from the perspective of an attacker. Not exactly convinced this is perfect, but certainly something
+#usable for most threats. 
+
+#adds things and encrypts key with master password and generates specific salt for this. Retrieving a password
+#gets the relevant salt and decodes successfully. Half-way-ish to a working basic program with not-awful security.
+#will need to research the security side of things more to be sure this isn't a waste of time. 
+
 
 #Defines a decorator to control db access - provides a cursor to use, and closes data after function.
-def database_access(function):
+def provide_database_cursor(function):
     def wrapper(*args, **kwargs):
         data = get_db_connection()
         cursor = data.cursor()
-        function(*args, cursor, **kwargs)
+        return_value = function(*args, cursor, **kwargs)
         data.commit()
         data.close()
+        return return_value
     return wrapper
         
 
@@ -62,28 +79,56 @@ def init_database():
     values['password'] = hashlib.sha256(initial_password.encode('UTF-8')).hexdigest()
     cursor.execute("create table hidden (password text)")
     cursor.execute("insert into hidden values (:password)", values)
+    cursor.execute("create table salts (account text primary key, salt text)")
     data.commit()
     data.close()
     print("Database created")
     exit(0)
 
+@provide_database_cursor
+def get_salt(account, cursor):
+    cursor.execute("select salt from salts where account=?", (account,))
+    return cursor.fetchone()
 
-@database_access
-def get_password(account, cursor, user=None):
+def encrypt_password(account, master_password, password):
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(
+        algorithm = hashes.SHA256(),
+        length = 32,
+        salt = salt,
+        iterations = 256000,
+        backend = default_backend())
+    key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
+    f = Fernet(key)
+    encrypted_password = f.encrypt(password.encode('UTF-8'))
+    return encrypted_password, salt
+    
+@provide_database_cursor
+def decrypt_password(account, master_password, cursor):
     cursor.execute("select password from logins where account=?", (account,))
-    result = cursor.fetchall()
+    password = cursor.fetchone()
+    kdf = PBKDF2HMAC(
+        algorithm = hashes.SHA256(),
+        length = 32,
+        salt = get_salt(account)[0],
+        iterations = 256000,
+        backend = default_backend())
 
-    if len(result) == 0:
-        print("No such account")
-        exit(0)
-    if len(result) == 1:
-        pc.copy(result[0][0])
-        print("Password for {} now in clipboard".format(account))
-        time.sleep(10)
-        pc.copy("VOID")
+    key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
+    f = Fernet(key)
+    password = f.decrypt(password[0]).decode('UTF-8')
+    return password
+
+
+def get_password(account, master_password, user=None):
+    password = decrypt_password(account, master_password)
+    pc.copy(password)
+    print("Password for {} now in clipboard".format(account))
+    time.sleep(10)
+    pc.copy("VOID")
 
         
-@database_access
+@provide_database_cursor
 def get_username(account, cursor):
     cursor.execute("select username from logins where account=?", (account,))
     result = cursor.fetchall()
@@ -102,8 +147,8 @@ def get_username(account, cursor):
         print(row[0])
 
 
-@database_access
-def add_new_record(cursor):
+@provide_database_cursor
+def add_new_record(master_password, cursor):
     record = {}
     record['account'] = input("Account: ")
     record['username'] = input("Username: ")
@@ -114,24 +159,27 @@ def add_new_record(cursor):
         print("ERROR: Password and Validation did not match")
         return
     
-    record['password'] = password
+    record['password'], record['salt'] = encrypt_password(record['account'], master_password, password)
     
     cursor.execute("insert into logins values (:account, :username, :password)", record)
+    cursor.execute("insert into salts values (:account, :salt)", record)
+
     print("Database updated - Added account {}".format(record['account']))
 
 
-@database_access
+@provide_database_cursor
 def delete_record(account, cursor):
     confirmation = input("Confirm deletion of account {} (y/n): ".format(account))
 
     if confirmation == 'y':
         cursor.execute("delete from logins where account=?", (account,))
+        cursor.execute("delete from salts where account=?", (account,))
         print("Database updated - Deleted account {}".format(account))
     else:
         print("Deletion aborted")
 
     
-@database_access
+@provide_database_cursor
 def list_accounts(cursor):
     result = cursor.execute("select account from logins")
     for row in result:
@@ -145,7 +193,7 @@ def check_args(args, n):
         sys.exit(2)
 
 
-@database_access
+@provide_database_cursor
 def authenticate_user(cursor):
     user_pass = getpass.getpass("Enter master password: ")
 
@@ -157,10 +205,12 @@ def authenticate_user(cursor):
         print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),result[0]))
         print("Wrong password")
         sys.exit(2)
+
+    return user_pass
     
         
-@database_access
-def get_login(account, cursor):
+@provide_database_cursor
+def get_login(account, master_password, cursor):
     cursor.execute("select username from logins where account=?", (account,))
     result = cursor.fetchall()
 
@@ -172,16 +222,15 @@ def get_login(account, cursor):
 
     input("Username for {} in clipboard. Press Enter for password...".format(account))
 
-    cursor.execute("select password from logins where account=?", (account,))
-    result = cursor.fetchone()
+    password = decrypt_password(account, master_password)
 
-    pc.copy(result[0])
+    pc.copy(password)
     print("Password for {} in clipboard. Clipboard will expire in 10 seconds.".format(account))
     time.sleep(10)
     pc.copy("VOID")
     
     
-@database_access
+@provide_database_cursor
 def change_master_password(cursor):
     new_password = getpass.getpass("Enter new master password: ")
     verification = getpass.getpass("Enter again: ")
@@ -193,7 +242,9 @@ def change_master_password(cursor):
     cursor.execute("update hidden set password=?", (hashlib.sha256(new_password.encode('UTF-8')).hexdigest(),))
     #after this will need to re-encrypt database with new AES key based on master password.. once the
     # encryption is in place.
-        
+
+
+
 def parse_args():
     try:
         opts, args = getopt.getopt(sys.argv[1:], "l:p:u:d:",
@@ -203,18 +254,18 @@ def parse_args():
         usage()
         sys.exit(2)
 
-    authenticate_user()
+    master_password = authenticate_user()
 
     if len(opts) == 0:
         check_args(args,1)
         if args[0] == "add":
-            add_new_record()
+            add_new_record(master_password)
             exit(0)
         else:
             get_login(args[0])
             exit(0)
 
-    for opt, arg in opts:
+    for opt, arg in opts: #really there should only be one opt!
         if opt in ("-l", "--login"):
             get_login(arg)
             print("Clipboard expired")
@@ -226,7 +277,7 @@ def parse_args():
             exit(0)
 
         if opt in ("-p", "--password"):
-            get_password(arg)
+            get_password(arg, master_password)
             print("Clipboard expired")
             exit(0)
 
