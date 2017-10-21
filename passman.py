@@ -59,7 +59,7 @@ def get_db_connection():
     if not os.path.isfile(str(pathvar)+'/pass.db'):
         init_database()
         return
-    return db.connect(str(pathvar)+'/pass.db')
+    return db.connect(str(pathvar)+'/pass.db', timeout=10)
 
 
 def init_database():
@@ -82,7 +82,7 @@ def init_database():
     values['account'] = "master_password"
     values['salt'] = os.urandom(64)
     values['password'] = hashlib.pbkdf2_hmac('sha256', master_password.encode('UTF-8'),
-                                             values['salt'], 265000)
+                                             values['salt'], 256000)
     #values['password'] = hashlib.sha256(initial_password.encode('UTF-8')).hexdigest()
 
     cursor.execute("create table hidden (password text)")
@@ -98,12 +98,15 @@ def init_database():
     exit(0)
 
 @provide_database_cursor
-def get_salt(account, cursor):
-    cursor.execute("select salt from salts where account=?", (account,))
+def get_salt(account, cursor, user=None):
+    if user:
+        cursor.execute("select salt from salts where account=? and username=?", (account, user,))
+    else:
+        cursor.execute("select salt from salts where account=?", (account,))
     row = cursor.fetchone()
     return row['salt']
 
-def encrypt_password(account, master_password, password):
+def encrypt_password(master_password, password):
     salt = os.urandom(16)
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
@@ -117,8 +120,11 @@ def encrypt_password(account, master_password, password):
     return encrypted_password, salt
     
 @provide_database_cursor
-def decrypt_password(account, master_password, cursor):
-    cursor.execute("select password from logins where account=?", (account,))
+def decrypt_password(account, master_password, cursor, user=None):
+    if user:
+        cursor.execute("select password from logins where account=? and username=?", (account, user,))
+    else:
+        cursor.execute("select password from logins where account=?", (account,))
     row = cursor.fetchone()
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
@@ -164,7 +170,7 @@ def add_new_record(master_password, cursor):
         print("ERROR: Password and Validation did not match")
         return
     
-    record['password'], record['salt'] = encrypt_password(record['account'], master_password, password)
+    record['password'], record['salt'] = encrypt_password(master_password, password)
     
     cursor.execute("insert into logins values (:account, :username, :password)", record)
     cursor.execute("insert into salts values (:account, :salt)", record)
@@ -214,8 +220,7 @@ def authenticate_user(cursor):
     if hashlib.pbkdf2_hmac('sha256',
                            user_pass.encode('UTF-8'),
                            salt,
-                           265000) != hashed_master:
-        print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),hashed_master))
+                           256000) != hashed_master:
         print("Wrong password")
         sys.exit(2)
         
@@ -228,28 +233,39 @@ def authenticate_user(cursor):
     
         
 @provide_database_cursor
-def get_login(account, master_password, cursor):
+def get_login(account, master_password, cursor, user=None):
     cursor.execute("select username from logins where account=?", (account,))
     result = cursor.fetchall()
 
     if len(result) == 1:
-        pc.copy(result[0][0])
+        pc.copy(result[0]['username'])
     else:
         print("Non-unique username for this account type!")
         sys.exit(2)
 
     input("Username for {} in clipboard. Press Enter for password...".format(account))
 
-    password = decrypt_password(account, master_password)
+    password = decrypt_password(account, master_password, user) if user else decrypt_password(account, master_password)
 
     pc.copy(password)
     print("Password for {} in clipboard. Clipboard will expire in 10 seconds.".format(account))
     time.sleep(10)
     pc.copy("VOID")
     
+@provide_database_cursor
+def update_password(account, master_password, new_password, cursor):
+    print("updating password for {}".format(account))
+    encrypted_password, salt = encrypt_password(master_password, new_password)
+    row = {'password' : encrypted_password, 
+           'account' : account,
+           'salt' : salt}
+    cursor.execute("update logins set password=(:password) where account=(:account)", row)
+    cursor.execute("update salts set salt=(:salt) where account=(:account)", row)
+    print("done")
+    
     
 @provide_database_cursor
-def change_master_password(cursor):
+def change_master_password(master_password, cursor):
     new_password = getpass.getpass("Enter new master password: ")
     verification = getpass.getpass("Enter again: ")
 
@@ -257,11 +273,25 @@ def change_master_password(cursor):
         print("Passwords do not match! Aborting")
         sys.exit(0)
 
-    cursor.execute("update hidden set password=?", (hashlib.sha256(new_password.encode('UTF-8')).hexdigest(),))
-    #after this will need to re-encrypt database with new AES key based on master password.. once the
-    # encryption is in place.
+    data = {'salt' : os.urandom(64),
+            'new_pass_hashed' : hashlib.pbkdf2_hmac('sha256',
+                                                    new_password.encode('UTF-8'),
+                                                    data['salt'],
+                                                    256000)}
 
-
+    #update hash and salt to those for new password
+    cursor.execute("update hidden set password=(:new_pass_hashed)", data)
+    cursor.execute("update salts set salt=(:salt) where account='master_password'", data)
+    cursor.connection.commit() #without this, get db locked error. Commits needed between functions with transactions
+    
+    #update all passwords in db to use new master_password as key
+    cursor.execute("select * from logins")
+    rows = cursor.fetchall()
+    for row in rows:
+        update_password(row['account'],
+                        new_password,
+                        decrypt_password(row['account'], master_password))
+    
 
 def parse_args():
     try:
@@ -308,7 +338,7 @@ def parse_args():
             exit(0)
 
         if opt in ("--change-master"):
-            change_master_password()
+            change_master_password(master_password)
             print("Master password updated.")
             exit(0)
 
