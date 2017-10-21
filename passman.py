@@ -33,11 +33,14 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 #gets the relevant salt and decodes successfully. Half-way-ish to a working basic program with not-awful security.
 #will need to research the security side of things more to be sure this isn't a waste of time. 
 
+#Seems like a good idea to maybe switch away from sha256 (though it *is* good) to something else so that
+#weaker passwords form less of an attacking advantage (probably to pbkdf or some other slowed-hash function.)
 
 #Defines a decorator to control db access - provides a cursor to use, and closes data after function.
 def provide_database_cursor(function):
     def wrapper(*args, **kwargs):
         data = get_db_connection()
+        data.row_factory = db.Row #this allows accessing data in rows as if row is a dict.
         cursor = data.cursor()
         return_value = function(*args, cursor, **kwargs)
         data.commit()
@@ -67,28 +70,38 @@ def init_database():
     cursor = data.cursor()
     cursor.execute("create table logins (account text, username text, password text)")
 
-    initial_password = getpass.getpass("Enter a master password for the database (Up to 16 characters): ")
+    master_password = getpass.getpass("Enter a master password for the database (Ensure it is strong, 10+ characters): ")
     verification = getpass.getpass("Again for verification: ")
 
-    if initial_password != verification:
+    if master_password != verification:
         print("Password did not match verification, aborting")
         sys.exit(2)
 
     #store hash of password in table for authenticating the user
     values = {}
-    values['password'] = hashlib.sha256(initial_password.encode('UTF-8')).hexdigest()
+    values['account'] = "master_password"
+    values['salt'] = os.urandom(64)
+    values['password'] = hashlib.pbkdf2_hmac('sha256', master_password.encode('UTF-8'),
+                                             values['salt'], 265000)
+    #values['password'] = hashlib.sha256(initial_password.encode('UTF-8')).hexdigest()
+
     cursor.execute("create table hidden (password text)")
     cursor.execute("insert into hidden values (:password)", values)
-    cursor.execute("create table salts (account text primary key, salt text)")
+
+    cursor.execute("create table salts (account text primary key, salt blob)")
+    cursor.execute("insert into salts values (:account, :salt)", values)
+
     data.commit()
     data.close()
+
     print("Database created")
     exit(0)
 
 @provide_database_cursor
 def get_salt(account, cursor):
     cursor.execute("select salt from salts where account=?", (account,))
-    return cursor.fetchone()
+    row = cursor.fetchone()
+    return row['salt']
 
 def encrypt_password(account, master_password, password):
     salt = os.urandom(16)
@@ -106,17 +119,17 @@ def encrypt_password(account, master_password, password):
 @provide_database_cursor
 def decrypt_password(account, master_password, cursor):
     cursor.execute("select password from logins where account=?", (account,))
-    password = cursor.fetchone()
+    row = cursor.fetchone()
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
         length = 32,
-        salt = get_salt(account)[0],
+        salt = get_salt(account),
         iterations = 256000,
         backend = default_backend())
 
     key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
     f = Fernet(key)
-    password = f.decrypt(password[0]).decode('UTF-8')
+    password = f.decrypt(row['password']).decode('UTF-8')
     return password
 
 
@@ -131,20 +144,12 @@ def get_password(account, master_password, user=None):
 @provide_database_cursor
 def get_username(account, cursor):
     cursor.execute("select username from logins where account=?", (account,))
-    result = cursor.fetchall()
-    if len(result) == 0:
-        print("No such account")
-        exit(0)
-    if len(result) == 1:
-        pc.copy(result[0][0]) #learn more about how sqlite returns results!!
-        print("Username for {} now in clipboard".format(account))
-        time.sleep(10)
-        pc.copy("VOID")
-        return
-
-    #if non-unique username, list options.
-    for row in result:
-        print(row[0])
+    row = cursor.fetchone()
+    pc.copy(row['username']) #learn more about how sqlite returns results!!
+    print("Username for {} now in clipboard".format(account))
+    time.sleep(10)
+    pc.copy("VOID")
+    return
 
 
 @provide_database_cursor
@@ -181,15 +186,17 @@ def delete_record(account, cursor):
     
 @provide_database_cursor
 def list_accounts(cursor):
-    result = cursor.execute("select account from logins")
-    for row in result:
-        print(row[0])
+    rows = cursor.execute("select account from logins")
+    for row in rows:
+        print(row['account'])
     
 
 def check_args(args, n):
-    if len(args) != n:
+    if len(args) > n:
         print("ERROR: Too many args")
-        usage()
+        sys.exit(2)
+    elif len(args) < n:
+        print("ERROR: Too few args")
         sys.exit(2)
 
 
@@ -197,14 +204,25 @@ def check_args(args, n):
 def authenticate_user(cursor):
     user_pass = getpass.getpass("Enter master password: ")
 
+    cursor.execute("select salt from salts where account='master_password'")
+    salt = cursor.fetchone()['salt']
+
     cursor.execute("select password from hidden")
-    result = cursor.fetchone()
+    hashed_master = cursor.fetchone()['password']
 
     #if hash of user input is not the same as hash in database
-    if hashlib.sha256(user_pass.encode('UTF-8')).hexdigest() != result[0]:
-        print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),result[0]))
+    if hashlib.pbkdf2_hmac('sha256',
+                           user_pass.encode('UTF-8'),
+                           salt,
+                           265000) != hashed_master:
+        print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),hashed_master))
         print("Wrong password")
         sys.exit(2)
+        
+    #if hashlib.sha256(user_pass.encode('UTF-8')).hexdigest() != hashed_master:
+    #    print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),hashed_master))
+    #    print("Wrong password")
+    #    sys.exit(2)
 
     return user_pass
     
@@ -262,7 +280,7 @@ def parse_args():
             add_new_record(master_password)
             exit(0)
         else:
-            get_login(args[0])
+            get_login(args[0], master_password)
             exit(0)
 
     for opt, arg in opts: #really there should only be one opt!
