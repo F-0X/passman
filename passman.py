@@ -88,8 +88,8 @@ def init_database():
     cursor.execute("create table hidden (password text)")
     cursor.execute("insert into hidden values (:password)", values)
 
-    cursor.execute("create table salts (account text primary key, salt blob)")
-    cursor.execute("insert into salts values (:account, :salt)", values)
+    cursor.execute("create table salts (account text, username text, salt blob)")
+    cursor.execute("insert into salts values (:account, null, :salt)", values)
 
     data.commit()
     data.close()
@@ -140,7 +140,10 @@ def decrypt_password(account, master_password, cursor, user=None):
 
 
 def get_password(account, master_password, user=None):
-    password = decrypt_password(account, master_password)
+    if user:
+        password = decrypt_password(account, master_password, user)
+    else:
+        password = decrypt_password(account, master_password)
     pc.copy(password)
     print("Password for {} now in clipboard".format(account))
     time.sleep(10)
@@ -163,6 +166,7 @@ def add_new_record(master_password, cursor):
     record = {}
     record['account'] = input("Account: ")
     record['username'] = input("Username: ")
+
     password = getpass.getpass()
     password2 = getpass.getpass('Verify password:')
 
@@ -173,26 +177,49 @@ def add_new_record(master_password, cursor):
     record['password'], record['salt'] = encrypt_password(master_password, password)
     
     cursor.execute("insert into logins values (:account, :username, :password)", record)
-    cursor.execute("insert into salts values (:account, :salt)", record)
+    cursor.execute("insert into salts values (:account, :username, :salt)", record)
 
     print("Database updated - Added account {}".format(record['account']))
 
 
 @provide_database_cursor
-def delete_record(account, cursor):
+def delete_record(account, cursor, user=None):
+    if user:
+        confirmation = input("Confirm deletion of user {} for account type {} (y/n): ".format(user, account))
+        if confirmation == 'y':
+            cursor.execute("delete from logins where account=? and user=?", (account,user,))
+            cursor.execute("delete from salts where account=? and user=?", (account,user,))
+            print("Database updated - Deleted user {} from account type {}".format(user,account))
+            return
+        else:
+            print("Deletion aborted")
+            return
+
     confirmation = input("Confirm deletion of account {} (y/n): ".format(account))
+
+    cursor.execute("select * from logins where account=?", (account,))
+    rows = cursor.fetchall()
+    
+    if len(rows)>1:
+        print("Found multiple usernames associated to this account type")
+        users = [row['username'] for row in rows]
+        for user in users:
+            delete_record(account, user=user)
+        return
 
     if confirmation == 'y':
         cursor.execute("delete from logins where account=?", (account,))
         cursor.execute("delete from salts where account=?", (account,))
         print("Database updated - Deleted account {}".format(account))
+        return
     else:
         print("Deletion aborted")
+        return
 
     
 @provide_database_cursor
 def list_accounts(cursor):
-    rows = cursor.execute("select account from logins")
+    rows = cursor.execute("select distinct account from logins")
     for row in rows:
         print(row['account'])
     
@@ -200,9 +227,11 @@ def list_accounts(cursor):
 def check_args(args, n):
     if len(args) > n:
         print("ERROR: Too many args")
+        usage()
         sys.exit(2)
     elif len(args) < n:
         print("ERROR: Too few args")
+        usage()
         sys.exit(2)
 
 
@@ -234,18 +263,29 @@ def authenticate_user(cursor):
         
 @provide_database_cursor
 def get_login(account, master_password, cursor, user=None):
-    cursor.execute("select username from logins where account=?", (account,))
-    result = cursor.fetchall()
-
-    if len(result) == 1:
-        pc.copy(result[0]['username'])
+    if user:
+        pc.copy(user)
     else:
-        print("Non-unique username for this account type!")
-        sys.exit(2)
+        cursor.execute("select username from logins where account=?", (account,))
+        rows = cursor.fetchall()
+
+        if len(rows) == 1:
+            pc.copy(rows[0]['username'])
+        else:
+            usernames = [row['username'] for row in rows]
+            print("Non-unique username for this account type! Specify which username to use")
+            print("Usernames found:")
+            for user in usernames:
+                print("\t"+user)
+            user = input("Selection: ")
+            if user not in usernames:
+                print("Not an option - quitting")
+                sys.exit(2)
+            pc.copy(user)
 
     input("Username for {} in clipboard. Press Enter for password...".format(account))
 
-    password = decrypt_password(account, master_password, user) if user else decrypt_password(account, master_password)
+    password = decrypt_password(account, master_password, user=user) if user else decrypt_password(account, master_password)
 
     pc.copy(password)
     print("Password for {} in clipboard. Clipboard will expire in 10 seconds.".format(account))
@@ -291,11 +331,16 @@ def change_master_password(master_password, cursor):
         update_password(row['account'],
                         new_password,
                         decrypt_password(row['account'], master_password))
+
+
+def usage():
+    print("to be written later")
     
 
 def parse_args():
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "l:p:u:d:",
+        opts, args = getopt.getopt(sys.argv[1:],
+                                   "l:p:u:d:",
                                    ["login=","password=","username=", "list", "delete=", "change-master"])
     except getopt.GetoptError as err:
         print(err)
