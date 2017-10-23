@@ -1,42 +1,26 @@
 #!/usr/bin/python3
 
-import sqlite3 as db
+import base64
 import getopt
 import getpass
-import time
-import pathlib
-import sys
-import pyperclip as pc
-import os.path
 import hashlib #sha256, pdkdf2_hmac.
-import base64
 import os
+import os.path
+import pathlib
+import pyperclip as pc
+import readline
+import sqlite3 as db
+import sys
+import time
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-#TODO: High importance - security! some form of encryption and user authentication is necessary.
-#      Otherwise, general use can likely be improved a bit.
-# Perhaps use the cryptography package (available on pip) for both the encryption of passwords and
-# for the hashing of database password?
-#
-# Ensure master password input is at most 16 characters
-
-#Hash master password securely, and use to verify it. Use unhashed master password as key to en/decrypt
-#passwords in database. This is independent of verification so a hacked db achieves nothing but annoyance
-#from the perspective of an attacker. Not exactly convinced this is perfect, but certainly something
-#usable for most threats. 
-
-#adds things and encrypts key with master password and generates specific salt for this. Retrieving a password
-#gets the relevant salt and decodes successfully. Half-way-ish to a working basic program with not-awful security.
-#will need to research the security side of things more to be sure this isn't a waste of time. 
-
-#Seems like a good idea to maybe switch away from sha256 (though it *is* good) to something else so that
-#weaker passwords form less of an attacking advantage (probably to pbkdf or some other slowed-hash function.)
 
 #Defines a decorator to control db access - provides a cursor to use, and closes data after function.
+#Cursor sent to last non-kwarg parameter.
 def provide_database_cursor(function):
     def wrapper(*args, **kwargs):
         data = get_db_connection()
@@ -52,13 +36,16 @@ def provide_database_cursor(function):
 def get_db_connection():
     pathvar = pathlib.Path().home()
     pathvar = pathlib.Path(pathvar/'.passman')
+    
     if not pathvar.exists():
         pathvar.mkdir()
         init_database()
         return 
+
     if not os.path.isfile(str(pathvar)+'/pass.db'):
         init_database()
         return
+
     return db.connect(str(pathvar)+'/pass.db', timeout=10)
 
 
@@ -97,45 +84,60 @@ def init_database():
     print("Database created")
     exit(0)
 
+
 @provide_database_cursor
 def get_salt(account, cursor, user=None):
     if user:
         cursor.execute("select salt from salts where account=? and username=?", (account, user,))
     else:
         cursor.execute("select salt from salts where account=?", (account,))
+
     row = cursor.fetchone()
+
     return row['salt']
+
 
 def encrypt_password(master_password, password):
     salt = os.urandom(16)
+
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
         length = 32,
         salt = salt,
         iterations = 256000,
         backend = default_backend())
+
     key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
     f = Fernet(key)
     encrypted_password = f.encrypt(password.encode('UTF-8'))
+    
     return encrypted_password, salt
     
+
 @provide_database_cursor
 def decrypt_password(account, master_password, cursor, user=None):
     if user:
         cursor.execute("select password from logins where account=? and username=?", (account, user,))
     else:
         cursor.execute("select password from logins where account=?", (account,))
+
     row = cursor.fetchone()
+    if row is None:
+        print("No password found for account {}, username {}".format(account, user))
+        exit(2)
+        
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
         length = 32,
-        salt = get_salt(account),
+        salt = get_salt(account,user=user),
         iterations = 256000,
         backend = default_backend())
 
     key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
     f = Fernet(key)
+    print(row['password'])
     password = f.decrypt(row['password']).decode('UTF-8')
+
     return password
 
 
@@ -144,6 +146,7 @@ def get_password(account, master_password, user=None):
         password = decrypt_password(account, master_password, user)
     else:
         password = decrypt_password(account, master_password)
+
     pc.copy(password)
     print("Password for {} now in clipboard".format(account))
     time.sleep(10)
@@ -154,7 +157,7 @@ def get_password(account, master_password, user=None):
 def get_username(account, cursor):
     cursor.execute("select username from logins where account=?", (account,))
     row = cursor.fetchone()
-    pc.copy(row['username']) #learn more about how sqlite returns results!!
+    pc.copy(row['username'])
     print("Username for {} now in clipboard".format(account))
     time.sleep(10)
     pc.copy("VOID")
@@ -219,9 +222,12 @@ def delete_record(account, cursor, user=None):
     
 @provide_database_cursor
 def list_accounts(cursor):
-    rows = cursor.execute("select distinct account from logins")
+    rows = cursor.execute("select distinct account from logins").fetchall()
     for row in rows:
+        usernames = cursor.execute("select username from logins where account=?", (row['account'],)).fetchall()
         print(row['account'])
+        for names in usernames:
+            print("\t"+names['username'])
     
 
 def check_args(args, n):
@@ -252,11 +258,6 @@ def authenticate_user(cursor):
                            256000) != hashed_master:
         print("Wrong password")
         sys.exit(2)
-        
-    #if hashlib.sha256(user_pass.encode('UTF-8')).hexdigest() != hashed_master:
-    #    print("user hash = {}, db data = {}".format(hashlib.sha256(user_pass.encode('UTF-8')).hexdigest(),hashed_master))
-    #    print("Wrong password")
-    #    sys.exit(2)
 
     return user_pass
     
@@ -269,18 +270,37 @@ def get_login(account, master_password, cursor, user=None):
         cursor.execute("select username from logins where account=?", (account,))
         rows = cursor.fetchall()
 
-        if len(rows) == 1:
+        if len(rows) == 0:
+            print("No logins associated with {}".format(account))
+            exit(0)
+
+        elif len(rows) == 1: #if unique username for account type.
             pc.copy(rows[0]['username'])
+
         else:
             usernames = [row['username'] for row in rows]
+            
+            def completer(text, state):
+                options = [i for i in usernames if i.startswith(text)]
+                if state<len(options):
+                    return options[state]
+                else:
+                    return None
+                
+            readline.parse_and_bind("tab: complete")
+            readline.set_completer(completer)
+
             print("Non-unique username for this account type! Specify which username to use")
             print("Usernames found:")
+            
             for user in usernames:
                 print("\t"+user)
-            user = input("Selection: ")
+                
+            user = input("Selection (tab to autocomplete): ")
             if user not in usernames:
                 print("Not an option - quitting")
                 sys.exit(2)
+                
             pc.copy(user)
 
     input("Username for {} in clipboard. Press Enter for password...".format(account))
@@ -292,15 +312,25 @@ def get_login(account, master_password, cursor, user=None):
     time.sleep(10)
     pc.copy("VOID")
     
+
 @provide_database_cursor
-def update_password(account, master_password, new_password, cursor):
-    print("updating password for {}".format(account))
+def update_password(account, master_password, new_password, cursor, user=None):
+    if user:
+        print("updating password for user {}, account {}".format(user,account))
+    else:
+        print("updating password for account {}".format(account))
+
     encrypted_password, salt = encrypt_password(master_password, new_password)
     row = {'password' : encrypted_password, 
            'account' : account,
+           'username' : user,
            'salt' : salt}
-    cursor.execute("update logins set password=(:password) where account=(:account)", row)
-    cursor.execute("update salts set salt=(:salt) where account=(:account)", row)
+    if user:
+        cursor.execute("update logins set password=(:password) where account=(:account) and username=(:username)", row)
+        cursor.execute("update salts set salt=(:salt) where account=(:account) and username=(:username)", row)
+    else:
+        cursor.execute("update logins set password=(:password) where account=(:account)", row)
+        cursor.execute("update salts set salt=(:salt) where account=(:account)", row)
     print("done")
     
     
@@ -340,8 +370,14 @@ def usage():
 def parse_args():
     try:
         opts, args = getopt.getopt(sys.argv[1:],
-                                   "l:p:u:d:",
-                                   ["login=","password=","username=", "list", "delete=", "change-master"])
+                                   "l:p:u:d:U:",
+                                   ["login=",
+                                    "password=",
+                                    "username=",
+                                    "list",
+                                    "delete=",
+                                    "update=",
+                                    "change-master"])
     except getopt.GetoptError as err:
         print(err)
         usage()
@@ -360,12 +396,14 @@ def parse_args():
 
     for opt, arg in opts: #really there should only be one opt!
         if opt in ("-l", "--login"):
-            get_login(arg)
-            print("Clipboard expired")
+            get_login(arg, master_password)
             exit(0)
 
         if opt in ("-u", "--username"):
-            get_username(arg)
+            if len(args) == 0:
+                print("No account type provided")
+                exit(2)
+            get_login(args[0], master_password, user=arg)
             print("Clipboard expired")
             exit(0)
 
@@ -380,6 +418,12 @@ def parse_args():
 
         if opt in ("--list"):
             list_accounts()
+            exit(0)
+
+        if opt in ("-U", "--update"):
+            #get new password.
+            #handle user somehow.
+            update_password(arg, master_password)
             exit(0)
 
         if opt in ("--change-master"):
