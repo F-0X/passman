@@ -18,6 +18,8 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+PAUSE_TIME = 5
+
 
 #Defines a decorator to control db access - provides a cursor to use, and closes data after function.
 #Cursor sent to last non-kwarg parameter.
@@ -70,7 +72,6 @@ def init_database():
     values['salt'] = os.urandom(64)
     values['password'] = hashlib.pbkdf2_hmac('sha256', master_password.encode('UTF-8'),
                                              values['salt'], 256000)
-    #values['password'] = hashlib.sha256(initial_password.encode('UTF-8')).hexdigest()
 
     cursor.execute("create table hidden (password text)")
     cursor.execute("insert into hidden values (:password)", values)
@@ -98,7 +99,7 @@ def get_salt(account, cursor, user=None):
 
 
 def encrypt_password(master_password, password):
-    salt = os.urandom(16)
+    salt = os.urandom(64)
 
     kdf = PBKDF2HMAC(
         algorithm = hashes.SHA256(),
@@ -135,7 +136,6 @@ def decrypt_password(account, master_password, cursor, user=None):
 
     key = base64.urlsafe_b64encode(kdf.derive(master_password.encode('UTF-8')))
     f = Fernet(key)
-    print(row['password'])
     password = f.decrypt(row['password']).decode('UTF-8')
 
     return password
@@ -149,7 +149,7 @@ def get_password(account, master_password, user=None):
 
     pc.copy(password)
     print("Password for {} now in clipboard".format(account))
-    time.sleep(10)
+    time.sleep(PAUSE_TIME)
     pc.copy("VOID")
 
         
@@ -159,7 +159,7 @@ def get_username(account, cursor):
     row = cursor.fetchone()
     pc.copy(row['username'])
     print("Username for {} now in clipboard".format(account))
-    time.sleep(10)
+    time.sleep(PAUSE_TIME)
     pc.copy("VOID")
     return
 
@@ -225,9 +225,11 @@ def list_accounts(cursor):
     rows = cursor.execute("select distinct account from logins").fetchall()
     for row in rows:
         usernames = cursor.execute("select username from logins where account=?", (row['account'],)).fetchall()
-        print(row['account'])
+        account_string = row['account']+':  ' 
         for names in usernames:
-            print("\t"+names['username'])
+            account_string += names['username']
+            account_string += ', '
+        print(account_string+'\n')
     
 
 def check_args(args, n):
@@ -280,6 +282,7 @@ def get_login(account, master_password, cursor, user=None):
         else:
             usernames = [row['username'] for row in rows]
             
+            #Create tab completion of the possible usernames
             def completer(text, state):
                 options = [i for i in usernames if i.startswith(text)]
                 if state<len(options):
@@ -303,28 +306,30 @@ def get_login(account, master_password, cursor, user=None):
                 
             pc.copy(user)
 
-    input("Username for {} in clipboard. Press Enter for password...".format(account))
-
     password = decrypt_password(account, master_password, user=user) if user else decrypt_password(account, master_password)
 
+    input("Username for {} in clipboard. Press Enter for password...".format(account))
+
     pc.copy(password)
-    print("Password for {} in clipboard. Clipboard will expire in 10 seconds.".format(account))
-    time.sleep(10)
+    print("Password for {} in clipboard. Clipboard will expire in {} seconds.".format(account, PAUSE_TIME))
+    time.sleep(PAUSE_TIME)
     pc.copy("VOID")
     
 
 @provide_database_cursor
 def update_password(account, master_password, new_password, cursor, user=None):
     if user:
-        print("updating password for user {}, account {}".format(user,account))
+        print("updating record for account {}, user {}...".format(account,user))
     else:
-        print("updating password for account {}".format(account))
+        print("updating record for account {}...".format(account))
 
     encrypted_password, salt = encrypt_password(master_password, new_password)
+
     row = {'password' : encrypted_password, 
            'account' : account,
            'username' : user,
            'salt' : salt}
+
     if user:
         cursor.execute("update logins set password=(:password) where account=(:account) and username=(:username)", row)
         cursor.execute("update salts set salt=(:salt) where account=(:account) and username=(:username)", row)
@@ -343,10 +348,11 @@ def change_master_password(master_password, cursor):
         print("Passwords do not match! Aborting")
         sys.exit(0)
 
-    data = {'salt' : os.urandom(64),
+    salt = os.urandom(64)
+    data = {'salt' : salt,
             'new_pass_hashed' : hashlib.pbkdf2_hmac('sha256',
                                                     new_password.encode('UTF-8'),
-                                                    data['salt'],
+                                                    salt,
                                                     256000)}
 
     #update hash and salt to those for new password
@@ -360,7 +366,10 @@ def change_master_password(master_password, cursor):
     for row in rows:
         update_password(row['account'],
                         new_password,
-                        decrypt_password(row['account'], master_password))
+                        decrypt_password(row['account'], master_password),
+                        user = row['username'])
+        #this is going to need to pick out the users so that they decrypt with the correct salt,
+        #lest we get invalid token/signature did not match digest errors!
 
 
 def usage():
